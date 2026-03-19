@@ -99,6 +99,7 @@ def transcribe(
     speakers: int = typer.Option(None, "--speakers", "-s", help="Expected number of speakers"),
     output: Path = typer.Option(None, "--output", "-o", help="Output directory"),
     no_analytics: bool = typer.Option(False, "--no-analytics", help="Skip LLM analytics"),
+    text_only: bool = typer.Option(False, "--text-only", help="Output plain text only (no diarization, no LLM)"),
     resume: bool = typer.Option(False, "--resume", help="Resume incomplete job"),
     debug: bool = typer.Option(False, "--debug", help="Keep tmp dir after processing"),
 ):
@@ -179,8 +180,9 @@ def transcribe(
 
     if job_dir is None:
         job_dir = chunking.create_job_dir(file)
+        effective_overlap = 0 if text_only else overlap_duration
         manifest = chunking.create_manifest(
-            file, audio_path, duration, chunk_duration, overlap_duration, job_dir
+            file, audio_path, duration, chunk_duration, effective_overlap, job_dir
         )
 
     num_chunks = len(manifest["chunks"])
@@ -211,6 +213,42 @@ def transcribe(
         f"Loading Whisper ({config['transcription']['whisper_model']})",
         tr.load_whisper_model, config,
     )
+
+    if text_only:
+        # -- Text-only mode: transcribe chunks, concatenate text, write .txt --
+        all_texts = []
+        for chunk_info in manifest["chunks"]:
+            idx = chunk_info["index"]
+            chunk_path = job_dir / chunk_info["filename"]
+            chunk_label = f"Chunk {idx + 1}/{num_chunks}"
+            console.print(f"  [bold]{chunk_label}[/bold]")
+
+            raw_result = _step("  Transcribing", tr.transcribe, chunk_path, config, model=whisper_model_obj, device=device)
+            for seg in raw_result.get("segments", []):
+                text = seg.get("text", "").strip()
+                if text:
+                    all_texts.append(text)
+
+        plain_text = " ".join(all_texts)
+
+        output_dir = config["output"].get("output_dir", "")
+        if output_dir:
+            out_path = Path(output_dir) / f"{file.stem}.txt"
+        else:
+            out_path = file.parent / f"{file.stem}.txt"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(plain_text, encoding="utf-8")
+
+        if not config["output"].get("keep_audio", False) and audio_path != file:
+            audio_path.unlink(missing_ok=True)
+        if not debug:
+            chunking.cleanup_job_dir(job_dir)
+
+        console.print(f"\n[green]✓[/green] Done: [bold]{out_path.name}[/bold]")
+        console.print(f"  Characters: {len(plain_text)}")
+        console.print()
+        return
+
     import torch
     if device == "mlx" or device == "cpu":
         diarize_device = "mps" if torch.backends.mps.is_available() else "cpu"

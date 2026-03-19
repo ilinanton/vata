@@ -6,7 +6,7 @@ whisper_model = "large-v3-turbo"
 language = "ru"               # or "auto" for auto-detection
 device = "auto"               # "auto" (CUDA → CPU), "cuda", or "cpu"
 compute_type = "int8"         # auto-overridden to float16 on CUDA
-batch_size = 16               # parallel audio chunks for whisper (higher = faster, more RAM)
+batch_size = 32               # parallel audio chunks for whisper (higher = faster, more RAM)
 threads = 0                   # CPU threads for CTranslate2 (0 = auto)
 
 [diarization]
@@ -28,8 +28,8 @@ naming_model = "mistralai/mistral-7b-instruct"
 analytics_model = "anthropic/claude-3-haiku"
 
 [chunking]
-chunk_duration = 120              # seconds per chunk
-overlap_duration = 30             # seconds of overlap between chunks
+chunk_duration = 600              # seconds per chunk
+overlap_duration = 15             # seconds of overlap between chunks
 speaker_similarity_threshold = 0.75  # cosine similarity threshold for speaker unification
 
 [output]
