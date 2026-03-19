@@ -4,6 +4,22 @@ from pathlib import Path
 
 _patched = False
 
+# Mapping from short model names to MLX HuggingFace repos
+_MLX_MODEL_MAP = {
+    "tiny": "mlx-community/whisper-tiny",
+    "base": "mlx-community/whisper-base-mlx",
+    "small": "mlx-community/whisper-small-mlx",
+    "medium": "mlx-community/whisper-medium-mlx",
+    "large-v2": "mlx-community/whisper-large-v2-mlx",
+    "large-v3": "mlx-community/whisper-large-v3-mlx",
+    "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
+    "turbo": "mlx-community/whisper-turbo",
+}
+
+
+def _get_backend(config: dict) -> str:
+    return config.get("transcription", {}).get("backend", "whisperx")
+
 
 def detect_device(config: dict) -> str:
     """Return the best available compute device for CTranslate2.
@@ -76,13 +92,23 @@ def _apply_compat_patches():
 
 
 def load_whisper_model(config: dict):
-    """Load WhisperX model. Call once and reuse across chunks."""
+    """Load WhisperX model. Call once and reuse across chunks.
+
+    For MLX backend, returns (model_repo_id, "mlx") instead of a model object.
+    """
+    tc = config["transcription"]
+    backend = _get_backend(config)
+
+    if backend == "mlx":
+        model_name = tc["whisper_model"]
+        repo = _MLX_MODEL_MAP.get(model_name, model_name)
+        return repo, "mlx"
+
     _apply_compat_patches()
     import whisperx
 
     device = detect_device(config)
     ct = compute_type_for_device(device, config)
-    tc = config["transcription"]
 
     threads = tc.get("threads", 0)
     kwargs = {}
@@ -107,20 +133,33 @@ def load_diarization_pipeline(env: dict, device: str = "cpu"):
     return DiarizationPipeline(use_auth_token=hf_token, device=device)
 
 
-def transcribe(audio_path: Path, config: dict, model=None, device: str = "cpu") -> dict:
-    """Transcribe an audio file via WhisperX.
+def _transcribe_mlx(audio_path: Path, config: dict, model_repo: str) -> dict:
+    """Transcribe using mlx-whisper (Apple Silicon GPU)."""
+    import mlx_whisper
 
-    Returns the raw result dict from whisperx (segments with word-level timestamps).
-    If model is provided, reuses it; otherwise loads a new one (backward compat).
-    """
+    tc = config["transcription"]
+    language = tc.get("language", "ru")
+
+    kwargs = {}
+    if language and language != "auto":
+        kwargs["language"] = language
+
+    result = mlx_whisper.transcribe(
+        str(audio_path),
+        path_or_hf_repo=model_repo,
+        word_timestamps=True,
+        verbose=False,
+        **kwargs,
+    )
+    return result
+
+
+def _transcribe_whisperx(audio_path: Path, config: dict, model, device: str) -> dict:
+    """Transcribe using WhisperX (CTranslate2 CPU/CUDA)."""
     _apply_compat_patches()
     import whisperx
 
     tc = config["transcription"]
-
-    if model is None:
-        model, device = load_whisper_model(config)
-
     batch_size = tc.get("batch_size", 16)
 
     audio = whisperx.load_audio(str(audio_path))
@@ -137,8 +176,24 @@ def transcribe(audio_path: Path, config: dict, model=None, device: str = "cpu") 
     result = whisperx.align(
         result["segments"], align_model, metadata, audio, device
     )
-
     return result
+
+
+def transcribe(audio_path: Path, config: dict, model=None, device: str = "cpu") -> dict:
+    """Transcribe an audio file.
+
+    Returns a result dict with segments and word-level timestamps.
+    Uses MLX backend on Apple Silicon or WhisperX on CPU/CUDA.
+    """
+    tc = config["transcription"]
+
+    if model is None:
+        model, device = load_whisper_model(config)
+
+    if device == "mlx":
+        return _transcribe_mlx(audio_path, config, model_repo=model)
+    else:
+        return _transcribe_whisperx(audio_path, config, model, device)
 
 
 def diarize(
@@ -155,11 +210,10 @@ def diarize(
     _apply_compat_patches()
     import whisperx
 
-    device = "cpu"
     dc = config["diarization"]
 
     if pipeline is None:
-        pipeline = load_diarization_pipeline(env, device)
+        pipeline = load_diarization_pipeline(env)
 
     diarize_segments = pipeline(
         str(audio_path),

@@ -1,4 +1,6 @@
 [transcription]
+# Backend: "whisperx" (CPU/CUDA via CTranslate2) or "mlx" (Apple Silicon GPU)
+backend = "mlx"
 # Whisper model: tiny, base, small, medium, large-v2, large-v3, large-v3-turbo
 whisper_model = "large-v3-turbo"
 language = "ru"               # or "auto" for auto-detection

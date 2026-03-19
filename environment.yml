@@ -18,3 +18,4 @@ dependencies:
     - rich
     - jinja2
     - python-dotenv
+    - mlx-whisper

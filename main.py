@@ -198,16 +198,25 @@ def transcribe(
 
     # Step 3: Load models
     console.print()
-    device = tr.detect_device(config)
-    ct = tr.compute_type_for_device(device, config)
-    batch_size = config.get("transcription", {}).get("batch_size", 16)
-    console.print(f"  Device: [bold]{device}[/bold] (compute_type={ct}, batch_size={batch_size})")
+    backend = config.get("transcription", {}).get("backend", "whisperx")
+    if backend == "mlx":
+        console.print(f"  Backend: [bold]MLX[/bold] (Apple Silicon GPU)")
+    else:
+        device = tr.detect_device(config)
+        ct = tr.compute_type_for_device(device, config)
+        batch_size = config.get("transcription", {}).get("batch_size", 16)
+        console.print(f"  Device: [bold]{device}[/bold] (compute_type={ct}, batch_size={batch_size})")
 
     whisper_model_obj, device = _step(
         f"Loading Whisper ({config['transcription']['whisper_model']})",
         tr.load_whisper_model, config,
     )
-    diarize_pipeline = _step("Loading diarization pipeline", tr.load_diarization_pipeline, env, device)
+    import torch
+    if device == "mlx" or device == "cpu":
+        diarize_device = "mps" if torch.backends.mps.is_available() else "cpu"
+    else:
+        diarize_device = device
+    diarize_pipeline = _step("Loading diarization pipeline", tr.load_diarization_pipeline, env, diarize_device)
 
     hf_token = env.get("HF_TOKEN", "")
     embedding_model = _step("Loading embedding model", chunking.load_embedding_model, hf_token)
