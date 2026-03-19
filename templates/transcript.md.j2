@@ -1,9 +1,13 @@
 ---
 title: {{ title }}
 date: {{ date }}
+processed: {{ processed }}
 participants: {{ participants | join(", ") }}
 source: {{ source_file }}
 model_transcription: {{ whisper_model }}
+model_diarization: {{ diarization_model }}
+model_embedding: {{ embedding_model }}
+model_naming: {{ naming_model }}
 model_analytics: {{ analytics_model }}
 ---
 

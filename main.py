@@ -310,12 +310,24 @@ def transcribe(
     participants = list(dict.fromkeys(seg["speaker"] for seg in segments))
     duration_str = tr.calculate_duration(segments)
 
+    from datetime import date as _date, datetime as _datetime
+
+    # date: conversation date from analytics, fallback to source file creation date
+    conversation_date = analytics.get("date", "")
+    if not conversation_date:
+        file_ctime = file.stat().st_birthtime
+        conversation_date = _datetime.fromtimestamp(file_ctime).strftime("%Y-%m-%d")
+
     data = {
         "title": analytics.get("title", file.stem),
-        "date": analytics.get("date", ""),
+        "date": conversation_date,
+        "processed": _date.today().isoformat(),
         "participants": participants,
         "source_file": file.name,
         "whisper_model": config["transcription"]["whisper_model"],
+        "diarization_model": "pyannote/speaker-diarization-3.1",
+        "embedding_model": "pyannote/wespeaker-voxceleb-resnet34-LM",
+        "naming_model": llm_config["naming_model"],
         "analytics_model": llm_config["analytics_model"],
         "duration": duration_str,
         "summary": analytics.get("summary", ""),
