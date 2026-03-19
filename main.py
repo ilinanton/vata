@@ -98,11 +98,13 @@ def transcribe(
     analytics_model: str = typer.Option(None, "--analytics-model", help="Model for analytics"),
     speakers: int = typer.Option(None, "--speakers", "-s", help="Expected number of speakers"),
     output: Path = typer.Option(None, "--output", "-o", help="Output directory"),
+    no_analytics: bool = typer.Option(False, "--no-analytics", help="Skip LLM analytics"),
+    resume: bool = typer.Option(False, "--resume", help="Resume incomplete job"),
+    debug: bool = typer.Option(False, "--debug", help="Keep tmp dir after processing"),
 ):
     """Transcribe a video/audio file."""
-    from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
-
     from pipeline import audio, formatter, llm, transcribe as tr
+    from pipeline import chunking
 
     # Validate file
     if not file.exists():
@@ -126,66 +128,187 @@ def transcribe(
     if output:
         config["output"]["output_dir"] = str(output)
 
+    # Chunking config
+    cc = config.get("chunking", {})
+    chunk_duration = cc.get("chunk_duration", 900)
+    overlap_duration = cc.get("overlap_duration", 30)
+    similarity_threshold = cc.get("speaker_similarity_threshold", 0.75)
+
+    import time
+
+    def _fmt_duration(seconds: float) -> str:
+        """Format seconds as human-readable duration."""
+        m, s = divmod(int(seconds), 60)
+        h, m = divmod(m, 60)
+        if h:
+            return f"{h}h {m:02d}m {s:02d}s"
+        if m:
+            return f"{m}m {s:02d}s"
+        return f"{s}s"
+
+    def _step(label: str, func, *args, **kwargs):
+        """Run func with a spinner, print ✓ on success, return result."""
+        t0 = time.monotonic()
+        with console.status(f"  {label}"):
+            result = func(*args, **kwargs)
+        elapsed = _fmt_duration(time.monotonic() - t0)
+        console.print(f"  [green]✓[/green] {label} [dim]({elapsed})[/dim]")
+        return result
+
     console.print("\n[bold]VATA v1.0[/bold] — Video Audio Text Analytics\n")
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        TimeElapsedColumn(),
-        console=console,
-    ) as progress:
-        # Step 1: Audio extraction
-        task = progress.add_task("[1/4] Extracting audio...", total=None)
-        audio_path = audio.extract_audio(file)
-        progress.update(task, completed=True)
-        progress.remove_task(task)
-        console.print("[green]✓[/green] [1/4] Audio extraction")
+    # -- File info --
+    file_size_mb = file.stat().st_size / (1024 * 1024)
+    console.print(f"  File:   [bold]{file.name}[/bold] ({file_size_mb:.1f} MB)")
 
-        # Step 2: Transcription
-        task = progress.add_task("[2/4] Transcribing...", total=None)
-        raw_result = tr.transcribe(audio_path, config)
-        progress.update(task, completed=True)
-        progress.remove_task(task)
-        whisper_model = config["transcription"]["whisper_model"]
-        console.print(f"[green]✓[/green] [2/4] Transcription ({whisper_model})")
+    # Step 1: Audio extraction
+    audio_path = _step("Extracting audio", audio.extract_audio, file)
 
-        # Step 3: Diarization
-        task = progress.add_task("[3/4] Diarizing...", total=None)
-        segments = tr.diarize(audio_path, raw_result, config, env)
-        progress.update(task, completed=True)
-        progress.remove_task(task)
-        console.print("[green]✓[/green] [3/4] Diarization (pyannote)")
+    # Step 2: Duration + chunks
+    duration = _step("Reading audio duration", audio.get_audio_duration, audio_path)
+    console.print(f"  Duration: [bold]{_fmt_duration(duration)}[/bold]")
 
-        # Step 4: LLM analysis
-        task = progress.add_task("[4/4] Analyzing...", total=None)
-        llm_provider = config["llm"]["provider"]
-        llm_config = config["llm"][llm_provider]
-        client, _ = llm.create_client(config, env)
+    job_dir = None
+    manifest = None
 
-        # Speaker naming
-        speaker_mapping = llm.name_speakers(client, llm_config["naming_model"], segments)
-        segments = llm.apply_speaker_names(segments, speaker_mapping)
+    if resume:
+        job_dir = chunking.find_resumable_job(file)
+        if job_dir:
+            manifest = chunking.load_manifest(job_dir)
+            console.print(f"  [yellow]Resuming[/yellow] from [dim]{job_dir.name}[/dim]")
 
-        # Analytics
-        analytics = llm.generate_analytics(
-            client, llm_config["analytics_model"], segments, file.name
+    if job_dir is None:
+        job_dir = chunking.create_job_dir(file)
+        manifest = chunking.create_manifest(
+            file, audio_path, duration, chunk_duration, overlap_duration, job_dir
         )
-        progress.update(task, completed=True)
-        progress.remove_task(task)
-        console.print(f"[green]✓[/green] [4/4] Analysis ({llm_config['naming_model']})")
+
+    num_chunks = len(manifest["chunks"])
+    done_count = sum(1 for c in manifest["chunks"] if c["status"] == "done")
+    if done_count:
+        console.print(
+            f"  Chunks: [bold]{num_chunks}[/bold] "
+            f"({done_count} already done, {num_chunks - done_count} remaining)"
+        )
+    else:
+        console.print(f"  Chunks: [bold]{num_chunks}[/bold]")
+
+    _step("Splitting audio into chunks", chunking.split_audio_into_chunks, audio_path, manifest, job_dir)
+    chunking.save_manifest(job_dir, manifest)
+
+    # Step 3: Load models
+    console.print()
+    device = tr.detect_device(config)
+    ct = tr.compute_type_for_device(device, config)
+    batch_size = config.get("transcription", {}).get("batch_size", 16)
+    console.print(f"  Device: [bold]{device}[/bold] (compute_type={ct}, batch_size={batch_size})")
+
+    whisper_model_obj, device = _step(
+        f"Loading Whisper ({config['transcription']['whisper_model']})",
+        tr.load_whisper_model, config,
+    )
+    diarize_pipeline = _step("Loading diarization pipeline", tr.load_diarization_pipeline, env, device)
+
+    hf_token = env.get("HF_TOKEN", "")
+    embedding_model = _step("Loading embedding model", chunking.load_embedding_model, hf_token)
+
+    # Step 4+5: Transcribe + diarize each chunk
+    chunk_results: list[chunking.ChunkResult] = []
+    console.print()
+
+    for chunk_info in manifest["chunks"]:
+        idx = chunk_info["index"]
+        chunk_path = job_dir / chunk_info["filename"]
+        chunk_dur = chunk_info["end"] - chunk_info["start"]
+        chunk_label = f"Chunk {idx + 1}/{num_chunks} [{_fmt_duration(chunk_info['start'])}–{_fmt_duration(chunk_info['end'])}]"
+
+        # Resume: load cached results for completed chunks
+        if chunk_info["status"] == "done":
+            loaded = chunking.load_chunk_result(job_dir, chunk_info, manifest["overlap_duration"])
+            if loaded is not None:
+                chunk_results.append(loaded)
+                console.print(f"  [dim]⏭ {chunk_label} — loaded from cache[/dim]")
+                continue
+            else:
+                console.print(f"  [yellow]⚠ {chunk_label} — cache missing, reprocessing[/yellow]")
+                chunking.update_chunk_status(manifest, idx, "pending")
+
+        console.print(f"  [bold]{chunk_label}[/bold] ({_fmt_duration(chunk_dur)})")
+
+        # Transcribe
+        raw_result = _step("  Transcribing", tr.transcribe, chunk_path, config, model=whisper_model_obj, device=device)
+        chunking.update_chunk_status(manifest, idx, "transcribed")
+        chunking.save_manifest(job_dir, manifest)
+
+        # Diarize
+        segments, raw_diarize = _step(
+            "  Diarizing", tr.diarize,
+            chunk_path, raw_result, config, env, pipeline=diarize_pipeline,
+        )
+        chunking.update_chunk_status(manifest, idx, "diarized")
+
+        # Extract embeddings
+        speaker_embs = _step(
+            "  Extracting speaker embeddings",
+            chunking.extract_speaker_embeddings, chunk_path, segments, embedding_model,
+        )
+
+        n_speakers = len(set(s["speaker"] for s in segments))
+        n_segments = len(segments)
+        console.print(f"    [dim]{n_segments} segments, {n_speakers} speaker(s)[/dim]")
+
+        cr = chunking.ChunkResult(
+            index=idx,
+            start_offset=chunk_info["start"],
+            end_offset=chunk_info["end"],
+            overlap=manifest["overlap_duration"],
+            segments=segments,
+            speaker_embeddings=speaker_embs,
+        )
+        chunking.save_chunk_result(job_dir, cr)
+
+        chunking.update_chunk_status(manifest, idx, "done")
+        chunking.save_manifest(job_dir, manifest)
+
+        chunk_results.append(cr)
+
+    # Step 6: Unify speakers + merge
+    console.print()
+    speaker_mapping = _step("Unifying speakers across chunks", chunking.unify_speakers, chunk_results, similarity_threshold)
+    segments = chunking.merge_chunks(chunk_results, speaker_mapping)
+
+    # LLM analysis
+    llm_provider = config["llm"]["provider"]
+    llm_config = config["llm"][llm_provider]
+    client, _ = llm.create_client(config, env)
+
+    llm_speaker_mapping = _step(
+        f"Naming speakers ({llm_config['naming_model']})",
+        llm.name_speakers, client, llm_config["naming_model"], segments,
+    )
+    segments = llm.apply_speaker_names(segments, llm_speaker_mapping)
+
+    if no_analytics:
+        analytics = {"title": file.stem, "date": "", "summary": ""}
+        console.print("  [yellow]–[/yellow] Analytics skipped (--no-analytics)")
+    else:
+        analytics = _step(
+            f"Generating analytics ({llm_config['analytics_model']})",
+            llm.generate_analytics, client, llm_config["analytics_model"], segments, file.name,
+        )
 
     # Prepare template data
     participants = list(dict.fromkeys(seg["speaker"] for seg in segments))
-    duration = tr.calculate_duration(segments)
+    duration_str = tr.calculate_duration(segments)
 
     data = {
         "title": analytics.get("title", file.stem),
         "date": analytics.get("date", ""),
         "participants": participants,
         "source_file": file.name,
-        "whisper_model": whisper_model,
+        "whisper_model": config["transcription"]["whisper_model"],
         "analytics_model": llm_config["analytics_model"],
-        "duration": duration,
+        "duration": duration_str,
         "summary": analytics.get("summary", ""),
         "segments": [
             {
@@ -206,14 +329,19 @@ def transcribe(
 
     result_path = formatter.render_transcript(data, out_path)
 
-    # Remove temporary WAV
+    # Cleanup
     if not config["output"].get("keep_audio", False) and audio_path != file:
         audio_path.unlink(missing_ok=True)
+
+    if not debug:
+        chunking.cleanup_job_dir(job_dir)
+    else:
+        console.print(f"  [dim]Debug: tmp dir kept at {job_dir}[/dim]")
 
     # Final output
     console.print(f"\n[green]✓[/green] Done: [bold]{result_path.name}[/bold]")
     console.print(f"  Speakers: {len(participants)} ({', '.join(participants)})")
-    console.print(f"  Duration: {duration}")
+    console.print(f"  Duration: {duration_str}")
     console.print(f"  Segments: {len(segments)}")
     console.print()
 

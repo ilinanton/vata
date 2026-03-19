@@ -7,10 +7,11 @@ AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".flac"}
 
 
 def extract_audio(input_path: Path) -> Path:
-    """Extract audio from a video file or return audio file as-is.
+    """Extract audio from a video file or convert non-WAV audio to WAV.
 
     - Video files are converted to WAV 16kHz mono.
-    - Audio files are returned unchanged.
+    - Non-WAV audio files are converted to WAV 16kHz mono.
+    - WAV files are returned unchanged.
     """
     input_path = Path(input_path)
 
@@ -19,10 +20,10 @@ def extract_audio(input_path: Path) -> Path:
 
     ext = input_path.suffix.lower()
 
-    if ext in AUDIO_EXTENSIONS:
+    if ext == ".wav":
         return input_path
 
-    if ext in VIDEO_EXTENSIONS:
+    if ext in AUDIO_EXTENSIONS | VIDEO_EXTENSIONS:
         output_path = input_path.with_suffix(".wav")
         import ffmpeg
 
@@ -40,3 +41,15 @@ def extract_audio(input_path: Path) -> Path:
         f"Unsupported format: {ext}. "
         f"Supported: {', '.join(supported)}"
     )
+
+
+def get_audio_duration(audio_path: Path) -> float:
+    """Get audio duration in seconds via ffprobe."""
+    import ffmpeg
+
+    probe = ffmpeg.probe(str(audio_path))
+    for stream in probe.get("streams", []):
+        if stream.get("codec_type") == "audio":
+            return float(stream["duration"])
+    # Fallback to format duration
+    return float(probe["format"]["duration"])

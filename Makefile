@@ -111,6 +111,7 @@ clean:
 	find . -name "*.tmp" -not -path "./.git/*" -delete
 	find . -name "__pycache__" -not -path "./.git/*" -exec rm -rf {} + 2>/dev/null || true
 	find . -name "*.pyc" -not -path "./.git/*" -delete
+	rm -rf tmp/
 	@echo "✓ Temporary files removed"
 
 .PHONY: reset
