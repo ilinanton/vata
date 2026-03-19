@@ -1,5 +1,25 @@
-/**/.idea/
-/**/.env
+# IDE
+.idea/
+
+# Secrets
+.env
+config.toml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Pipeline temporary files
+*.wav
+*.tmp
+
+# Output files (optional — remove if you want to commit results)
+output/
+
+# Claude Code
+/.claude
 /tasks
 /plans
-/.claude
+CLAUDE.md
